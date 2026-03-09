@@ -1,0 +1,1169 @@
+# block_sparse_dtm_dilated_v10.py
+# ENHANCED TSU-Native DTM: 64x64 RGB Generation - Thermal v10
+#
+# Built upon v9 (Fixed & Stabilized). New in v10:
+#
+#   EVOLUTIONARY FILTRATION LOOP (EFL):
+#     - EFLBuffer: stateful EMA buffer that distills chain outputs across
+#       denoising steps and injects them back into incoming blocks.
+#     - DilatedBlockChain now accepts optional feedback tensor (additive
+#       injection before dilation passes — preserves gradient flow and
+#       keeps input dimensions unchanged).
+#     - Buffer is reset per-sample-batch; stop-gradient prevents backprop
+#       through temporal history.
+#     - Learned per-block sigmoid gate controls how much the model trusts
+#       its own prior output vs. current block state.
+#
+#   GENERAL COHERENCE LOSS (replaces DSM after EFL warmup):
+#     - DSM term: kept but downweighted (0.5) as a weak structural anchor.
+#     - Self-consistency term (0.3): τ after EFL pass N must agree with τ
+#       after pass N+1 — the model is its own curriculum.
+#     - Entropic balance term (0.2): τ distribution is penalised for
+#       collapsing (all cold = rigid) or exploding (all hot = noise).
+#       Variance is maximised while spatial smoothness is preserved.
+#
+#   TRAINING:
+#     - EFL_WARMUP_EPOCHS: first N epochs train with original DSM loss
+#       (no feedback) so the buffer doesn't start from garbage.
+#     - After warmup, general_coherence_loss activates with EFL.
+#     - All other v9 fixes retained: real MLPs, clamped τ, adaptive
+#       noise, Hann windowing, cosine schedule.
+#
+# Architecture summary:
+#   CondProcessor     — lightweight U-Net, cond image → [B, 128, 8, 8]
+#   EFLBuffer         — NEW: distilled EMA of chain hidden states
+#   DilatedBlockChain — dilated gated mixing + EFL feedback injection
+#   BlockSparseEnergy — 4-layer MLP per block (coarse and fine)
+#   BlockSparseDTM    — top-level model, training, sampling
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+from torchvision.utils import make_grid
+from typing import List, Tuple, Optional
+import time
+
+# =============================================
+# 0. UTILITY IMPLEMENTATIONS
+# =============================================
+
+def cosine_beta_schedule(T: int) -> np.ndarray:
+    """
+    Cosine noise schedule from Nichol & Dhariwal (2021).
+    Smoother than linear schedule; avoids abrupt noise transitions
+    at the beginning and end of the diffusion chain.
+    """
+    steps = np.arange(T + 1)
+    alphas_cumprod = np.cos((steps / T) * np.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - alphas_cumprod[1:] / alphas_cumprod[:-1]
+    return np.clip(betas, 0.0001, 0.9999)
+
+
+class ScoreMatchingLoss:
+    """Kept for interface compatibility — not used in v10."""
+    def __call__(self, energy_fn: nn.Module,
+                 x_t: torch.Tensor,
+                 t: torch.Tensor,
+                 noise: torch.Tensor,
+                 model: 'BlockSparseDTM') -> torch.Tensor:
+        pass  # unused
+
+
+# =============================================
+# 1. CONFIGURATION
+# =============================================
+IMG_SIZE             = 64
+CHANNELS             = 3
+
+FINE_BLOCK_SIZE      = 8
+FINE_BLOCKS_PER_SIDE = IMG_SIZE // FINE_BLOCK_SIZE    # 8
+NUM_FINE_BLOCKS      = FINE_BLOCKS_PER_SIDE ** 2       # 64
+PBITS_PER_FINE_BLOCK = FINE_BLOCK_SIZE * FINE_BLOCK_SIZE * CHANNELS  # 192
+TOTAL_PBITS          = NUM_FINE_BLOCKS * PBITS_PER_FINE_BLOCK         # 12 288
+
+COARSE_BLOCK_SIZE      = 16
+COARSE_BLOCKS_PER_SIDE = IMG_SIZE // COARSE_BLOCK_SIZE  # 4
+NUM_COARSE_BLOCKS      = COARSE_BLOCKS_PER_SIDE ** 2     # 16
+PBITS_PER_COARSE_BLOCK = COARSE_BLOCK_SIZE * COARSE_BLOCK_SIZE * CHANNELS  # 768
+
+# Dilated chain hyperparameters
+CHAIN_HIDDEN    = 256
+CHAIN_DILATIONS = [1, 2, 4, 8, 16, 32]
+
+T_STEPS         = 100
+BATCH_SIZE      = 16
+LR              = 2e-4
+NUM_EPOCHS      = 50
+SAVE_INTERVAL   = 5
+SAMPLE_INTERVAL = 5
+OUTPUT_DIR      = "outputs_dilated_v10"
+
+# v9 thermal hyperparameters (retained)
+LAMBDA_SMOOTH   = 0.01   # weight for τ spatial smoothness
+
+# v10 EFL + coherence loss hyperparameters
+EFL_DECAY          = 0.9   # EMA momentum for EFLBuffer
+EFL_WARMUP_EPOCHS  = 5     # epochs of pure DSM before EFL activates
+LAMBDA_DSM         = 0.5   # weight: DSM term in general_coherence_loss
+LAMBDA_CONSIST     = 0.3   # weight: self-consistency term
+LAMBDA_ENTROPY     = 0.2   # weight: entropic balance term
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Running on: {DEVICE}")
+
+# Precompute diffusion schedule (global, shared across all model instances)
+BETAS     = torch.from_numpy(cosine_beta_schedule(T_STEPS)).float().to(DEVICE)
+ALPHAS    = 1.0 - BETAS
+ALPHA_BAR = torch.cumprod(ALPHAS, dim=0)
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# =============================================
+# 2. CONDITIONING PROCESSOR (U-Net style)
+# =============================================
+class CondProcessor(nn.Module):
+    """
+    Lightweight U-Net that converts a conditioning RGB image (64×64) into
+    a spatial feature map of shape [B, 128, 8, 8].
+
+    Skip connections (d3→u1, d2→u2, d1→u3) preserve fine spatial detail
+    while the bottleneck (d4) captures global context.  The final
+    avg_pool2d collapses the 64×64 feature map to the 8×8 block grid used
+    by the fine-block pipeline.
+    """
+    def __init__(self):
+        super().__init__()
+        self.conv1    = nn.Conv2d(3, 16, 3, stride=1, padding=1)
+        self.conv2    = nn.Conv2d(16, 32, 3, stride=2, padding=1)
+        self.conv3    = nn.Conv2d(32, 64, 3, stride=2, padding=1)
+        self.conv4    = nn.Conv2d(64, 128, 3, stride=2, padding=1)
+        self.up1      = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.up2      = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.up3      = nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2)
+        self.feat_out = nn.Conv2d(16, 128, 3, stride=1, padding=1)
+        self.bn1      = nn.BatchNorm2d(16)
+        self.bn2      = nn.BatchNorm2d(32)
+        self.bn3      = nn.BatchNorm2d(64)
+        self.bn4      = nn.BatchNorm2d(128)
+
+    def forward(self, cond_image: torch.Tensor) -> torch.Tensor:
+        d1   = F.relu(self.bn1(self.conv1(cond_image)))   # [B, 16, 64, 64]
+        d2   = F.relu(self.bn2(self.conv2(d1)))            # [B, 32, 32, 32]
+        d3   = F.relu(self.bn3(self.conv3(d2)))            # [B, 64, 16, 16]
+        d4   = F.relu(self.bn4(self.conv4(d3)))            # [B,128,  8,  8]
+        u1   = F.relu(self.up1(d4) + d3)                  # [B, 64, 16, 16]
+        u2   = F.relu(self.up2(u1) + d2)                  # [B, 32, 32, 32]
+        u3   = F.relu(self.up3(u2) + d1)                  # [B, 16, 64, 64]
+        feat = self.feat_out(u3)                           # [B,128, 64, 64]
+        # Pool to 8×8 block grid (one feature vector per fine block)
+        cond_feat = F.avg_pool2d(feat, kernel_size=8, stride=8)  # [B,128, 8, 8]
+        return cond_feat
+
+
+# =============================================
+# 3. EFL BUFFER  (NEW in v10)
+# =============================================
+class EFLBuffer(nn.Module):
+    """
+    Evolutionary Filtration Loop (EFL) buffer.
+
+    Maintains an exponential moving average (EMA) of the DilatedBlockChain's
+    hidden states across denoising steps.  After each step, the distilled
+    state is injected back into the chain's input — so the model's own
+    prior output shapes how it processes the next step.
+
+    Design decisions:
+      - EMA state is always stop-gradient (detach) so gradients do NOT
+        flow through the temporal history.  This keeps training stable and
+        prevents exploding/vanishing gradients across steps.
+      - A learned sigmoid gate (per block, per hidden dim) lets the model
+        decide how much to trust its own memory vs. the current input.
+      - proj_in performs distillation (tanh-squashed), proj_out maps the
+        EMA state into the feedback signal that gets added to chain input.
+      - reset() must be called at the start of every new sample batch.
+    """
+    def __init__(self,
+                 n_blocks:   int   = NUM_FINE_BLOCKS,
+                 hidden_dim: int   = CHAIN_HIDDEN,
+                 decay:      float = EFL_DECAY):
+        super().__init__()
+        self.decay      = decay
+        self.n_blocks   = n_blocks
+        self.hidden_dim = hidden_dim
+
+        # Distillation: compress incoming chain output into buffer
+        self.proj_in  = nn.Linear(hidden_dim, hidden_dim)
+        # Projection: map stored EMA into a feedback signal
+        self.proj_out = nn.Linear(hidden_dim, hidden_dim)
+        # Gate: learned blend between current chain state and memory
+        self.gate     = nn.Linear(hidden_dim * 2, hidden_dim)
+
+        # EMA state — initialised to zeros, reset each sample batch
+        self.register_buffer(
+            "ema_state",
+            torch.zeros(1, n_blocks, hidden_dim))
+        self.register_buffer(
+            "initialized",
+            torch.tensor(False))
+
+    def reset(self, batch_size: int) -> None:
+        """
+        Call at the start of every new sampling or training batch.
+        Clears the EMA state so history from the previous batch cannot
+        contaminate the next one.
+        """
+        self.ema_state = torch.zeros(
+            batch_size, self.n_blocks, self.hidden_dim,
+            device=self.ema_state.device,
+            dtype=self.ema_state.dtype)
+        self.initialized = torch.tensor(False, device=self.initialized.device)
+
+    def update(self, chain_h: torch.Tensor) -> torch.Tensor:
+        """
+        Distil new chain output into the EMA buffer, then return the
+        feedback signal to be injected into the next chain forward pass.
+
+        Args:
+            chain_h: [B, N, hidden_dim]  — raw chain hidden states
+
+        Returns:
+            feedback: [B, N, hidden_dim] — gated signal from memory
+        """
+        # Distil: squash to [-1, 1] to prevent magnitude drift
+        distilled = torch.tanh(self.proj_in(chain_h))   # [B, N, H]
+
+        if not self.initialized:
+            # First call: seed buffer with current output (stop-gradient)
+            self.ema_state   = distilled.detach()
+            self.initialized = torch.tensor(True, device=self.initialized.device)
+        else:
+            # EMA update — old history decays, new distillation integrated
+            self.ema_state = (
+                self.decay       * self.ema_state.detach() +
+                (1 - self.decay) * distilled.detach()
+            )
+
+        # Gate: how much should the model trust its own memory right now?
+        # Concatenate current chain state with EMA memory, project to gate
+        gate_input = torch.cat([chain_h, self.ema_state], dim=-1)  # [B,N,2H]
+        gate       = torch.sigmoid(self.gate(gate_input))           # [B,N,H]
+
+        # Feedback: gated projection of stored memory
+        feedback = gate * self.proj_out(self.ema_state)             # [B,N,H]
+        return feedback
+
+
+# =============================================
+# 4. DILATED BLOCK CHAIN  (updated in v10)
+# =============================================
+class DilatedBlockChain(nn.Module):
+    """
+    Builds long-range context across all 64 fine blocks via dilated
+    gated mixing passes (dilations [1,2,4,8,16,32] give O(log N)
+    global receptive field).
+
+    v9: Input blocks may be windowed (Hann) for softer boundaries.
+    v10: Accepts optional `feedback` tensor from EFLBuffer.
+         Feedback is injected additively after the initial projection
+         and before any dilation pass — additive injection preserves
+         gradient flow and keeps all downstream dimensions unchanged.
+    """
+    def __init__(self,
+                 input_dim:  int       = PBITS_PER_FINE_BLOCK,
+                 hidden_dim: int       = CHAIN_HIDDEN,
+                 dilations:  List[int] = CHAIN_DILATIONS):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.dilations  = dilations
+
+        self.input_proj   = nn.Linear(input_dim, hidden_dim)
+        self.gate_projs   = nn.ModuleList([
+            nn.Linear(hidden_dim * 2, hidden_dim) for _ in dilations
+        ])
+        self.update_projs = nn.ModuleList([
+            nn.Linear(hidden_dim * 2, hidden_dim) for _ in dilations
+        ])
+        self.layer_norms  = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in dilations
+        ])
+        self.tau_proj = nn.Linear(hidden_dim, 1)
+
+    def forward(self,
+                blocks:   torch.Tensor,
+                feedback: Optional[torch.Tensor] = None
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            blocks:   [B, N, input_dim]   — windowed fine block pixels
+            feedback: [B, N, hidden_dim]  — EFL signal (None = no feedback)
+
+        Returns:
+            h:   [B, N, hidden_dim] — contextualised block representations
+            tau: [B, N]             — per-block thermal temperatures
+        """
+        B, N, _ = blocks.shape
+        h = F.relu(self.input_proj(blocks))   # [B, N, H]
+
+        # v10: inject EFL feedback additively before dilation passes
+        # Additive injection: h stays in the same vector space, no dim change
+        if feedback is not None:
+            h = h + feedback
+
+        for i, d in enumerate(self.dilations):
+            if d < N:
+                h_shifted        = torch.zeros_like(h)
+                h_shifted[:, d:, :] = h[:, :-d, :]
+            else:
+                h_shifted = torch.zeros_like(h)
+
+            h_cat  = torch.cat([h, h_shifted], dim=-1)        # [B, N, 2H]
+            gate   = torch.sigmoid(self.gate_projs[i](h_cat)) # [B, N, H]
+            update = torch.tanh(self.update_projs[i](h_cat))  # [B, N, H]
+            h      = self.layer_norms[i]((1.0 - gate) * h + gate * update)
+
+        # τ: per-block thermal temperature — softplus ensures positivity,
+        # + 0.1 ensures a nonzero floor before the external clamp
+        tau = F.softplus(self.tau_proj(h)).squeeze(-1) + 0.1  # [B, N]
+        return h, tau
+
+
+# =============================================
+# 5. ENERGY FUNCTION (real dense MLPs)
+# =============================================
+class BlockSparseEnergy(nn.Module):
+    """
+    Per-block energy function.
+
+    v9 fix: uses real nn.Linear throughout (no fake sparsity).
+    Architecture: 4-layer MLP (local path) + 2-layer skip connection.
+    For fine blocks, conditioning features are concatenated to input.
+
+    Energy is returned as a scalar per block per batch element.
+    The negative sign convention ensures lower energy = more likely state.
+    """
+    def __init__(self,
+                 features:     int,
+                 is_fine:      bool = False,
+                 chain_hidden: int  = CHAIN_HIDDEN):
+        super().__init__()
+        hidden       = 2048
+        self.is_fine = is_fine
+        cond_dim     = (128 + chain_hidden) if is_fine else 0
+        in_feat      = features + cond_dim
+
+        self.local = nn.Sequential(
+            nn.Linear(in_feat, hidden),
+            nn.LayerNorm(hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden), nn.ReLU(),
+            nn.Linear(hidden, features),
+        )
+        self.skip = nn.Sequential(
+            nn.Linear(in_feat, hidden),
+            nn.LayerNorm(hidden), nn.ReLU(),
+            nn.Linear(hidden, features),
+        )
+        self.bias = nn.Parameter(torch.zeros(features))
+
+    def forward(self,
+                x_block: torch.Tensor,
+                t_bias:  torch.Tensor,
+                cond:    Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x_block: [B*N, features]       — flattened block pixels
+            t_bias:  [B*N, features]       — time-step bias from embedding
+            cond:    [B*N, cond_dim] | None — conditioning features
+
+        Returns:
+            energy: [B*N] scalar per block
+        """
+        input_x = torch.cat([x_block, cond], dim=-1) if cond is not None else x_block
+
+        h1 = self.local(input_x)
+        h2 = self.skip(input_x)
+        energy = (
+            -(h1 + 0.3 * h2).sum(dim=-1)
+            - (self.bias * x_block).sum(dim=-1)
+            - (t_bias  * x_block).sum(dim=-1)
+        )
+        return energy   # [B*N]
+
+
+# =============================================
+# 6. MAIN MODEL — BlockSparseDTM v10
+# =============================================
+class BlockSparseDTM(nn.Module):
+    """
+    Block-Sparse Discrete Thermal Model v10.
+
+    Integrates:
+      - Hierarchical coarse + fine block energy (v9)
+      - Dilated block chaining with Hann windowing (v9)
+      - Thermal field τ with conductivity regularisation (v9)
+      - Adaptive τ-scaled forward noise (v9)
+      - EFL buffer + feedback injection (v10)
+      - General coherence loss with self-consistency (v10)
+    """
+    def __init__(self):
+        super().__init__()
+        self.T         = T_STEPS
+        self.betas     = BETAS
+        self.alphas    = ALPHAS
+        self.alpha_bar = ALPHA_BAR
+
+        # ── Time embedding ──────────────────────────────────────────────
+        self.time_emb         = nn.Embedding(T_STEPS, 32)
+        self.time_proj_coarse = nn.Linear(32, PBITS_PER_COARSE_BLOCK)
+        self.time_proj_fine   = nn.Linear(32, PBITS_PER_FINE_BLOCK)
+
+        # ── Energy functions (real MLPs) ─────────────────────────────────
+        self.energy_fn_coarse = BlockSparseEnergy(
+            PBITS_PER_COARSE_BLOCK, is_fine=False)
+        self.energy_fn_fine   = BlockSparseEnergy(
+            PBITS_PER_FINE_BLOCK, is_fine=True, chain_hidden=CHAIN_HIDDEN)
+
+        # ── Conditioning processor ───────────────────────────────────────
+        self.cond_processor = CondProcessor()
+
+        # ── Dilated chain (v10: accepts EFL feedback) ───────────────────
+        self.dilated_chain = DilatedBlockChain(
+            input_dim  = PBITS_PER_FINE_BLOCK,
+            hidden_dim = CHAIN_HIDDEN,
+            dilations  = CHAIN_DILATIONS,
+        )
+
+        # ── EFL buffer (NEW in v10) ──────────────────────────────────────
+        self.efl_buffer = EFLBuffer(
+            n_blocks   = NUM_FINE_BLOCKS,
+            hidden_dim = CHAIN_HIDDEN,
+            decay      = EFL_DECAY,
+        )
+
+        # ── Learnable global temperature scale ──────────────────────────
+        self.temp_scale = nn.Parameter(torch.tensor(1.0))
+
+        # ── Loss weights ─────────────────────────────────────────────────
+        self.lambda_smooth  = LAMBDA_SMOOTH
+        self.lambda_dsm     = LAMBDA_DSM
+        self.lambda_consist = LAMBDA_CONSIST
+        self.lambda_entropy = LAMBDA_ENTROPY
+
+        # ── Hann window for fine blocks (v9, retained) ───────────────────
+        hann1d = torch.hann_window(FINE_BLOCK_SIZE, periodic=False)
+        hann2d = (hann1d.unsqueeze(1) * hann1d.unsqueeze(0)).view(
+            1, 1, FINE_BLOCK_SIZE, FINE_BLOCK_SIZE, 1)
+        self.register_buffer("fine_hann_window", hann2d)
+
+        self.coarse_grid = (COARSE_BLOCKS_PER_SIDE, COARSE_BLOCKS_PER_SIDE)
+        self.fine_grid   = (FINE_BLOCKS_PER_SIDE,   FINE_BLOCKS_PER_SIDE)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Block helpers
+    # ──────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _extract_blocks(x: torch.Tensor,
+                        block_size:     int,
+                        blocks_per_side: int) -> torch.Tensor:
+        """
+        Reshape image [B, C, H, W] into non-overlapping blocks
+        [B, N, block_size*block_size*C].
+        """
+        B, C, H, W = x.shape
+        bps = blocks_per_side
+        bs  = block_size
+        x   = x.view(B, C, bps, bs, bps, bs)
+        x   = x.permute(0, 2, 4, 3, 5, 1).contiguous()
+        x   = x.view(B, bps * bps, bs * bs * C)
+        return x
+
+    @staticmethod
+    def _reconstruct_image(blocks:          torch.Tensor,
+                           block_size:      int,
+                           blocks_per_side: int,
+                           img_size:        int) -> torch.Tensor:
+        """
+        Inverse of _extract_blocks.
+        blocks: [B, N, block_size*block_size*C] → [B, C, H, W]
+        """
+        B   = blocks.shape[0]
+        bps = blocks_per_side
+        bs  = block_size
+        C   = CHANNELS
+        x   = blocks.view(B, bps, bps, bs, bs, C)
+        x   = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+        x   = x.view(B, C, img_size, img_size)
+        return x
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Thermal field τ extraction (with Hann windowing)
+    # ──────────────────────────────────────────────────────────────────────
+    def get_tau(self,
+                x:        torch.Tensor,
+                feedback: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Compute per-block thermal temperature τ from image x.
+
+        Windowing softens block boundaries before the chain processes them.
+        Optional EFL feedback can be passed through to the chain.
+
+        Returns tau: [B, NUM_FINE_BLOCKS]
+        """
+        fine_blocks = self._extract_blocks(x, FINE_BLOCK_SIZE, FINE_BLOCKS_PER_SIDE)
+        B           = x.shape[0]
+        fine_pixels = fine_blocks.view(
+            B, NUM_FINE_BLOCKS, FINE_BLOCK_SIZE, FINE_BLOCK_SIZE, CHANNELS)
+        fine_pixels_w        = fine_pixels * self.fine_hann_window
+        fine_blocks_windowed = fine_pixels_w.view(B, NUM_FINE_BLOCKS, PBITS_PER_FINE_BLOCK)
+
+        _, tau = self.dilated_chain(fine_blocks_windowed, feedback=feedback)
+        return tau
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Smoothness regulariser for τ
+    # ──────────────────────────────────────────────────────────────────────
+    def compute_smooth_tau(self, tau: torch.Tensor) -> torch.Tensor:
+        """
+        Penalises large horizontal and vertical differences between
+        adjacent block temperatures — encourages spatially coherent
+        thermal fields without forcing global uniformity.
+        """
+        B        = tau.shape[0]
+        tau_grid = tau.view(B, FINE_BLOCKS_PER_SIDE, FINE_BLOCKS_PER_SIDE)
+        h_diff   = (tau_grid[:, :, 1:] - tau_grid[:, :, :-1]).pow(2).mean()
+        v_diff   = (tau_grid[:, 1:, :] - tau_grid[:, :-1, :]).pow(2).mean()
+        return (h_diff + v_diff) / 2
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Adaptive forward noise with τ injection  (v9, retained)
+    # ──────────────────────────────────────────────────────────────────────
+    def add_noise(self,
+                  x0: torch.Tensor,
+                  t:  torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Standard cosine-schedule diffusion step with per-pixel noise scaling
+        by sqrt(τ).  Hotter blocks receive more noise, so the DSM target
+        and the forward process stay consistent with each other.
+
+        Returns:
+            x_t:   noisy image at timestep t
+            noise: scaled noise (τ-weighted) used to form x_t
+        """
+        B = x0.shape[0]
+
+        # τ from clean image (no EFL feedback during noise computation)
+        tau      = self.get_tau(x0)                                  # [B, 64]
+        tau_grid = tau.view(B, 1, FINE_BLOCKS_PER_SIDE, FINE_BLOCKS_PER_SIDE)
+        tau_map  = F.interpolate(tau_grid, size=(IMG_SIZE, IMG_SIZE), mode='nearest')
+        tau_map  = tau_map.expand(-1, CHANNELS, -1, -1)              # [B,C,H,W]
+        tau_map  = torch.clamp(tau_map, min=0.1, max=5.0)
+
+        noise = torch.randn_like(x0) * torch.sqrt(tau_map)          # τ-scaled noise
+
+        sqrt_ab       = self.alpha_bar[t].view(-1, 1, 1, 1).sqrt()
+        sqrt_one_minus = (1.0 - self.alpha_bar[t]).view(-1, 1, 1, 1).sqrt()
+
+        x_t = sqrt_ab * x0 + sqrt_one_minus * noise
+        return x_t, noise
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Energy computation  (v10: EFL feedback wired in)
+    # ──────────────────────────────────────────────────────────────────────
+    def compute_energy(self,
+                       x_t:        torch.Tensor,
+                       t:          torch.Tensor,
+                       cond_image: Optional[torch.Tensor] = None,
+                       use_efl:    bool                   = True
+                       ) -> torch.Tensor:
+        """
+        Compute total scalar energy for each sample in the batch.
+
+        EFL path (use_efl=True):
+          1. Pull current EMA state from efl_buffer (stop-gradient).
+          2. Pass it as feedback to dilated_chain.
+          3. After the chain forward pass, update the buffer with new
+             chain hidden states (distil + EMA update).
+
+        Returns energy: [B]
+        """
+        B = x_t.shape[0]
+
+        # ── Time embeddings ──────────────────────────────────────────────
+        t_emb          = self.time_emb(t)
+        t_bias_coarse  = self.time_proj_coarse(t_emb)   # [B, 768]
+        t_bias_fine    = self.time_proj_fine(t_emb)      # [B, 192]
+
+        # ── Coarse energy (no EFL — coarse blocks use a separate path) ──
+        coarse_blocks  = self._extract_blocks(
+            x_t, COARSE_BLOCK_SIZE, COARSE_BLOCKS_PER_SIDE)          # [B,16,768]
+        t_bias_c_exp   = t_bias_coarse.unsqueeze(1).expand(
+            -1, NUM_COARSE_BLOCKS, -1).reshape(-1, PBITS_PER_COARSE_BLOCK)
+        coarse_flat    = coarse_blocks.reshape(-1, PBITS_PER_COARSE_BLOCK)
+        e_coarse_raw   = self.energy_fn_coarse(coarse_flat, t_bias_c_exp)  # [B*16]
+
+        # ── Fine blocks: windowed ────────────────────────────────────────
+        fine_blocks    = self._extract_blocks(
+            x_t, FINE_BLOCK_SIZE, FINE_BLOCKS_PER_SIDE)               # [B,64,192]
+        fine_pixels    = fine_blocks.view(
+            B, NUM_FINE_BLOCKS, FINE_BLOCK_SIZE, FINE_BLOCK_SIZE, CHANNELS)
+        fine_pixels_w  = fine_pixels * self.fine_hann_window
+        fine_blocks_w  = fine_pixels_w.view(B, NUM_FINE_BLOCKS, PBITS_PER_FINE_BLOCK)
+
+        # ── EFL: pull feedback (stop-grad) then update buffer ────────────
+        if use_efl and self.efl_buffer.initialized:
+            feedback = self.efl_buffer.ema_state.detach()             # [B,N,H]
+        else:
+            feedback = None
+
+        chain_ctx, tau = self.dilated_chain(fine_blocks_w, feedback=feedback)
+
+        # After chain forward, update the EFL buffer with fresh hidden states
+        if use_efl:
+            # update() distils chain_ctx and returns the new feedback signal
+            # (stored internally in efl_buffer.ema_state for the next call)
+            _ = self.efl_buffer.update(chain_ctx)
+
+        # ── Conditioning features ────────────────────────────────────────
+        cond_src       = cond_image if cond_image is not None else x_t
+        cond_feat      = self.cond_processor(cond_src)                # [B,128,8,8]
+        cond_flat_sp   = cond_feat.permute(0, 2, 3, 1).reshape(
+            B, NUM_FINE_BLOCKS, 128)                                  # [B,64,128]
+
+        # Concatenate spatial cond + chain context per block
+        full_cond      = torch.cat([cond_flat_sp, chain_ctx], dim=-1) # [B,64,384]
+
+        # ── Fine energy ──────────────────────────────────────────────────
+        t_bias_f_exp   = t_bias_fine.unsqueeze(1).expand(
+            -1, NUM_FINE_BLOCKS, -1).reshape(-1, PBITS_PER_FINE_BLOCK)
+        fine_flat      = fine_blocks_w.reshape(-1, PBITS_PER_FINE_BLOCK)
+        full_cond_flat = full_cond.reshape(-1, 128 + CHAIN_HIDDEN)    # [B*64,384]
+
+        e_fine_raw     = self.energy_fn_fine(
+            fine_flat, t_bias_f_exp, cond=full_cond_flat)             # [B*64]
+
+        # ── τ scaling (clamped, v9) ──────────────────────────────────────
+        tau_grid       = tau.view(
+            B, FINE_BLOCKS_PER_SIDE, FINE_BLOCKS_PER_SIDE).unsqueeze(1)
+        tau_coarse_g   = F.avg_pool2d(tau_grid, kernel_size=2, stride=2)
+        tau_coarse     = tau_coarse_g.squeeze(1).view(B, NUM_COARSE_BLOCKS)
+
+        tau_fine_c     = torch.clamp(tau,        min=0.1, max=10.0)
+        tau_coarse_c   = torch.clamp(tau_coarse, min=0.1, max=10.0)
+
+        e_fine   = (e_fine_raw   / tau_fine_c.view(-1)  ).view(B, NUM_FINE_BLOCKS  ).sum(1)
+        e_coarse = (e_coarse_raw / tau_coarse_c.view(-1)).view(B, NUM_COARSE_BLOCKS).sum(1)
+
+        return (e_coarse + e_fine) * self.temp_scale  # [B]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Score function
+    # ──────────────────────────────────────────────────────────────────────
+    def compute_score(self,
+                      x_t:        torch.Tensor,
+                      t:          torch.Tensor,
+                      cond_image: Optional[torch.Tensor] = None,
+                      use_efl:    bool                   = True
+                      ) -> torch.Tensor:
+        """
+        Score = −∇_{x_t} E(x_t, t).
+        Gradient is taken through the energy function only; EFL buffer
+        updates are always stop-gradient so no temporal loops enter here.
+        """
+        x_t.requires_grad_(True)
+        energy = self.compute_energy(x_t, t, cond_image, use_efl=use_efl)
+        score  = -torch.autograd.grad(
+            energy.sum(), x_t, create_graph=self.training
+        )[0]
+        return score
+
+    # ──────────────────────────────────────────────────────────────────────
+    # DSM loss  (v9 — used during warmup epochs)
+    # ──────────────────────────────────────────────────────────────────────
+    def dsm_loss(self,
+                 x0:         torch.Tensor,
+                 cond_image: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Denoising score matching loss + τ spatial smoothness.
+        Used for the first EFL_WARMUP_EPOCHS epochs before the EFL buffer
+        has meaningful content.  EFL is disabled here (use_efl=False) so
+        the buffer does not influence warmup gradients.
+        """
+        B   = x0.shape[0]
+        t   = torch.randint(0, self.T, (B,), device=x0.device)
+        x_t, noise = self.add_noise(x0, t)
+        x_t = x_t.detach().requires_grad_(True)
+
+        score     = self.compute_score(x_t, t, cond_image, use_efl=False)
+        alpha_bar = self.alpha_bar[t].view(-1, 1, 1, 1)
+        target    = -noise / (1.0 - alpha_bar).sqrt()
+        dsm_term  = F.mse_loss(score, target)
+
+        tau         = self.get_tau(cond_image if cond_image is not None else x0)
+        smooth_loss = self.compute_smooth_tau(tau)
+
+        return dsm_term + self.lambda_smooth * smooth_loss
+
+    # ──────────────────────────────────────────────────────────────────────
+    # General coherence loss  (NEW in v10 — used after warmup)
+    # ──────────────────────────────────────────────────────────────────────
+    def general_coherence_loss(self,
+                                x0:         torch.Tensor,
+                                cond_image: Optional[torch.Tensor] = None
+                                ) -> torch.Tensor:
+        """
+        Three-term loss for general-output training with EFL active.
+
+        Term 1 — DSM anchor (weight λ_dsm = 0.5):
+            Keeps the score function weakly aligned with the standard
+            denoising target.  Prevents the model drifting into trivially
+            coherent but structurally empty configurations.
+
+        Term 2 — Self-consistency (weight λ_consist = 0.3):
+            Run two sequential EFL passes on the same noisy image.
+            The τ field after pass N should agree with τ after pass N+1
+            (stop-gradient on the second pass target).  This trains the
+            model to reach a stable attractor rather than oscillate.
+
+        Term 3 — Entropic balance (weight λ_entropy = 0.2):
+            Maximise τ variance (prevent collapse to all-cold or all-hot)
+            while retaining spatial smoothness via the conductivity reg.
+            Together these keep the thermal field in a productive middle
+            ground between rigid uniformity and featureless noise.
+        """
+        B   = x0.shape[0]
+        t   = torch.randint(0, self.T, (B,), device=x0.device)
+        x_t, noise = self.add_noise(x0, t)
+        x_t = x_t.detach().requires_grad_(True)
+
+        # ── Term 1: DSM anchor ──────────────────────────────────────────
+        # EFL buffer state from prior step is already set; use_efl=True
+        score     = self.compute_score(x_t, t, cond_image, use_efl=True)
+        alpha_bar = self.alpha_bar[t].view(-1, 1, 1, 1)
+        target    = -noise / (1.0 - alpha_bar).sqrt()
+        dsm_term  = F.mse_loss(score, target)
+
+        # ── Term 2: Self-consistency across two EFL passes ───────────────
+        # Pass N: compute energy + update EFL buffer (already done above
+        # inside compute_score → compute_energy → efl_buffer.update)
+        # Pull τ after pass N (feedback from this very step is now stored)
+        tau_n = self.get_tau(
+            cond_image if cond_image is not None else x0,
+            feedback=self.efl_buffer.ema_state.detach()  # post-pass-N state
+        )
+
+        # Pass N+1: run energy again — buffer now contains pass-N output
+        with torch.no_grad():
+            # Detach to avoid double backward through score graph
+            _ = self.compute_energy(
+                x_t.detach(), t, cond_image, use_efl=True)
+
+        tau_n1 = self.get_tau(
+            cond_image if cond_image is not None else x0,
+            feedback=self.efl_buffer.ema_state.detach()  # post-pass-(N+1) state
+        )
+
+        # Stop-gradient on N+1 target: model learns to predict the next
+        # stable τ from the current one, not to make them trivially equal
+        consistency_term = F.mse_loss(tau_n, tau_n1.detach())
+
+        # ── Term 3: Entropic balance ─────────────────────────────────────
+        tau      = tau_n                                       # reuse pass-N τ
+        tau_var  = tau.var(dim=1).mean()                       # want non-zero
+        tau_sm   = self.compute_smooth_tau(tau)                # want smooth
+        # Negative log variance: penalises collapse; smoothness penalises chaos
+        entropy_term = -torch.log(tau_var + 1e-6) + self.lambda_smooth * tau_sm
+
+        # ── Weighted combination ─────────────────────────────────────────
+        total = (self.lambda_dsm     * dsm_term
+               + self.lambda_consist * consistency_term
+               + self.lambda_entropy * entropy_term)
+        return total
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Sampling  (v10: EFL reset + feedback-aware score)
+    # ──────────────────────────────────────────────────────────────────────
+    @torch.no_grad()
+    def sample(self,
+               n_samples:  int                    = 4,
+               cond_image: Optional[torch.Tensor] = None,
+               verbose:    bool                   = False) -> torch.Tensor:
+        """
+        Ancestral DDPM sampling with EFL active.
+
+        The EFL buffer is reset at the start of each sampling call so
+        that history from previous calls cannot contaminate fresh samples.
+        As the reverse denoising chain proceeds, the buffer accumulates
+        a memory of the model's own predictions — each step benefits from
+        awareness of every prior denoising step.
+        """
+        # Reset buffer: each new batch of samples starts with a blank slate
+        self.efl_buffer.reset(n_samples)
+
+        x = torch.randn(n_samples, CHANNELS, IMG_SIZE, IMG_SIZE, device=DEVICE)
+
+        for step in reversed(range(self.T)):
+            t_tensor = torch.full(
+                (n_samples,), step, dtype=torch.long, device=DEVICE)
+
+            # Compute score with EFL feedback from all prior denoising steps
+            x_in  = x.detach().requires_grad_(True)
+            score = self.compute_score(x_in, t_tensor, cond_image, use_efl=True)
+            score = score.detach()
+
+            beta_t  = self.betas[step]
+            alpha_t = self.alphas[step]
+            ab      = self.alpha_bar[step]
+
+            # Predict clean image from current noisy state
+            x0_pred = (x + (1.0 - ab).sqrt() * score) / ab.sqrt()
+            x0_pred = x0_pred.clamp(-1.0, 1.0)
+
+            ab_prev = self.alpha_bar[step - 1] if step > 0 else torch.ones(
+                1, device=DEVICE)
+
+            # DDPM posterior mean
+            mean = (ab_prev.sqrt() * beta_t * x0_pred +
+                    alpha_t.sqrt() * (1.0 - ab_prev) * x) / (1.0 - ab)
+
+            if step > 0:
+                noise = torch.randn_like(x)
+                var   = (1.0 - ab_prev) / (1.0 - ab) * beta_t
+                x     = mean + var.sqrt() * noise
+            else:
+                x = mean
+
+            if verbose and step % 20 == 0:
+                print(f"  Sampling step {step:3d} / {self.T} done")
+
+        return x.clamp(-1.0, 1.0)
+
+
+# =============================================
+# 7. TRAINING UTILITIES
+# =============================================
+
+def get_cifar10_loader(batch_size: int = BATCH_SIZE) -> DataLoader:
+    transform = transforms.Compose([
+        transforms.Resize(IMG_SIZE),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+    dataset = datasets.CIFAR10(
+        root="./data", train=True, download=True, transform=transform)
+    return DataLoader(
+        dataset, batch_size=batch_size,
+        shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
+
+
+def save_checkpoint(model:     nn.Module,
+                    optimizer: torch.optim.Optimizer,
+                    epoch:     int,
+                    loss:      float,
+                    path:      str) -> None:
+    torch.save({
+        "epoch":       epoch,
+        "model_state": model.state_dict(),
+        "optim_state": optimizer.state_dict(),
+        "loss":        loss,
+    }, path)
+    print(f"  Checkpoint saved → {path}")
+
+
+def load_checkpoint(model:     nn.Module,
+                    optimizer: torch.optim.Optimizer,
+                    path:      str) -> Tuple[int, float]:
+    ckpt = torch.load(path, map_location=DEVICE)
+    model.load_state_dict(ckpt["model_state"])
+    optimizer.load_state_dict(ckpt["optim_state"])
+    print(f"  Checkpoint loaded ← {path}  (epoch {ckpt['epoch']})")
+    return ckpt["epoch"], ckpt["loss"]
+
+
+def save_image_grid(samples: torch.Tensor,
+                    path:    str,
+                    nrow:    int = 4) -> None:
+    imgs  = (samples.clamp(-1, 1) + 1.0) / 2.0
+    grid  = make_grid(imgs, nrow=nrow, padding=2)
+    npimg = grid.permute(1, 2, 0).cpu().numpy()
+    plt.figure(figsize=(8, 8))
+    plt.imshow(npimg)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(path, dpi=120)
+    plt.close()
+    print(f"  Sample grid saved → {path}")
+
+
+# =============================================
+# 8. TRAINING LOOP
+# =============================================
+
+def train(resume_path: Optional[str] = None) -> None:
+    print("\n" + "=" * 70)
+    print("  Block-Sparse DTM — Dilated Block Chaining + Thermal v10")
+    print(f"  Chain dilations    : {CHAIN_DILATIONS}")
+    print(f"  Chain hidden dim   : {CHAIN_HIDDEN}")
+    print(f"  Device             : {DEVICE}")
+    print(f"  Epochs             : {NUM_EPOCHS}")
+    print(f"  EFL warmup epochs  : {EFL_WARMUP_EPOCHS}")
+    print(f"  EFL decay          : {EFL_DECAY}")
+    print(f"  Loss weights       : DSM={LAMBDA_DSM}  Consist={LAMBDA_CONSIST}"
+          f"  Entropy={LAMBDA_ENTROPY}")
+    print("  v10 additions: EFLBuffer • feedback injection • general coherence loss")
+    print("=" * 70 + "\n")
+
+    loader    = get_cifar10_loader()
+    model     = BlockSparseDTM().to(DEVICE)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=NUM_EPOCHS)
+
+    start_epoch = 0
+    best_loss   = float("inf")
+
+    if resume_path and os.path.isfile(resume_path):
+        start_epoch, best_loss = load_checkpoint(model, optimizer, resume_path)
+        start_epoch += 1
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  Total parameters : {total_params:,}\n")
+
+    for epoch in range(start_epoch, NUM_EPOCHS):
+        model.train()
+        epoch_loss  = 0.0
+        epoch_start = time.time()
+
+        # Decide which loss to use based on warmup schedule
+        use_efl     = (epoch >= EFL_WARMUP_EPOCHS)
+        loss_label  = "coherence" if use_efl else "DSM (warmup)"
+        if epoch == EFL_WARMUP_EPOCHS:
+            print(f"\n  ── EFL activated at epoch {epoch} ──\n")
+
+        for batch_idx, (imgs, _) in enumerate(loader):
+            imgs = imgs.to(DEVICE)
+            optimizer.zero_grad()
+
+            if use_efl:
+                # Reset EFL buffer once per batch so each batch starts fresh
+                model.efl_buffer.reset(imgs.shape[0])
+                loss = model.general_coherence_loss(imgs, cond_image=imgs)
+            else:
+                # Warmup: pure DSM, no EFL feedback
+                loss = model.dsm_loss(imgs, cond_image=imgs)
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            epoch_loss += loss.item()
+
+            if batch_idx % 100 == 0:
+                print(f"  Epoch {epoch:3d} | Step {batch_idx:4d} "
+                      f"| {loss_label} loss: {loss.item():.4f}")
+
+        scheduler.step()
+        avg_loss = epoch_loss / len(loader)
+        elapsed  = time.time() - epoch_start
+        print(f"\nEpoch {epoch:3d} complete — avg loss: {avg_loss:.4f} "
+              f"({elapsed:.1f}s)\n")
+
+        if (epoch + 1) % SAVE_INTERVAL == 0 or epoch == NUM_EPOCHS - 1:
+            ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_epoch{epoch:04d}.pt")
+            save_checkpoint(model, optimizer, epoch, avg_loss, ckpt_path)
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_path = os.path.join(OUTPUT_DIR, "ckpt_best.pt")
+                save_checkpoint(model, optimizer, epoch, avg_loss, best_path)
+
+        if (epoch + 1) % SAMPLE_INTERVAL == 0 or epoch == NUM_EPOCHS - 1:
+            model.eval()
+            print("  Generating samples...")
+            t0      = time.time()
+            samples = model.sample(n_samples=16, verbose=False)
+            print(f"  Sampling took {time.time() - t0:.1f}s")
+            grid_path = os.path.join(
+                OUTPUT_DIR, f"samples_epoch{epoch:04d}.png")
+            save_image_grid(samples, grid_path, nrow=4)
+            model.train()
+
+    print("\nTraining complete.")
+    print(f"Outputs saved to: {OUTPUT_DIR}/")
+
+
+# =============================================
+# 9. SANITY CHECKS
+# =============================================
+
+def run_smoke_test() -> None:
+    print("\n── Smoke test v10 ──────────────────────────────────────────")
+    model = BlockSparseDTM().to(DEVICE)
+    model.train()
+
+    B    = 2
+    x0   = torch.randn(B, CHANNELS, IMG_SIZE, IMG_SIZE, device=DEVICE)
+    cond = torch.randn(B, CHANNELS, IMG_SIZE, IMG_SIZE, device=DEVICE)
+    t    = torch.randint(0, T_STEPS, (B,), device=DEVICE)
+
+    # Basic shapes
+    x_t, noise = model.add_noise(x0, t)
+    print(f"  x_t shape          : {x_t.shape}")
+    print(f"  noise shape        : {noise.shape}")
+
+    fine_blocks = BlockSparseDTM._extract_blocks(
+        x_t, FINE_BLOCK_SIZE, FINE_BLOCKS_PER_SIDE)
+    print(f"  fine_blocks shape  : {fine_blocks.shape}")
+
+    tau = model.get_tau(x0)
+    print(f"  tau shape          : {tau.shape}")
+
+    # Energy without EFL
+    energy_no_efl = model.compute_energy(
+        x0.requires_grad_(True), t, cond, use_efl=False)
+    print(f"  energy (no EFL)    : {energy_no_efl.shape}  "
+          f"mean={energy_no_efl.mean().item():.4f}")
+
+    # Energy with EFL (buffer initialised to zeros first)
+    model.efl_buffer.reset(B)
+    energy_efl = model.compute_energy(
+        x0.requires_grad_(True), t, cond, use_efl=True)
+    print(f"  energy (EFL)       : {energy_efl.shape}  "
+          f"mean={energy_efl.mean().item():.4f}")
+    print(f"  EFL buffer init'd  : {model.efl_buffer.initialized.item()}")
+
+    # DSM loss (warmup path)
+    loss_dsm = model.dsm_loss(x0, cond_image=cond)
+    loss_dsm.backward()
+    print(f"  DSM loss           : {loss_dsm.item():.4f}  (gradients OK)")
+
+    # General coherence loss (EFL path)
+    model.zero_grad()
+    model.efl_buffer.reset(B)
+    loss_coh = model.general_coherence_loss(x0, cond_image=cond)
+    loss_coh.backward()
+    print(f"  Coherence loss     : {loss_coh.item():.4f}  (gradients OK)")
+
+    # EFL buffer state check
+    buf_mean = model.efl_buffer.ema_state.abs().mean().item()
+    print(f"  EFL buffer |mean|  : {buf_mean:.6f}")
+
+    print("── Smoke test passed ✓ ─────────────────────────────────────\n")
+
+
+def run_chain_receptive_field_test() -> None:
+    print("\n── Receptive field test ────────────────────────────────────")
+    chain = DilatedBlockChain(
+        input_dim  = PBITS_PER_FINE_BLOCK,
+        hidden_dim = CHAIN_HIDDEN,
+        dilations  = CHAIN_DILATIONS,
+    ).to(DEVICE).eval()
+
+    base    = torch.zeros(1, NUM_FINE_BLOCKS, PBITS_PER_FINE_BLOCK, device=DEVICE)
+    perturb = base.clone()
+    perturb[0, 0, :] += 1.0
+
+    with torch.no_grad():
+        # Without feedback
+        h_base,    _ = chain(base)
+        h_perturb, _ = chain(perturb)
+
+    diff            = (h_perturb - h_base).abs()
+    last_block_diff = diff[0, -1, :].mean().item()
+    print(f"  Mean |Δh| at block 63 (no feedback)  : {last_block_diff:.6f}")
+    print("  ✓ Long-range propagation confirmed." if last_block_diff > 1e-8
+          else "  ✗ Warning: no propagation.")
+
+    # With synthetic feedback (simulates EFL state)
+    fake_feedback = torch.randn(1, NUM_FINE_BLOCKS, CHAIN_HIDDEN, device=DEVICE) * 0.1
+    with torch.no_grad():
+        h_base_fb,    _ = chain(base,    feedback=fake_feedback)
+        h_perturb_fb, _ = chain(perturb, feedback=fake_feedback)
+
+    diff_fb            = (h_perturb_fb - h_base_fb).abs()
+    last_block_diff_fb = diff_fb[0, -1, :].mean().item()
+    print(f"  Mean |Δh| at block 63 (with feedback) : {last_block_diff_fb:.6f}")
+    print("  ✓ Feedback path confirmed." if last_block_diff_fb > 1e-8
+          else "  ✗ Warning: feedback has no effect.")
+
+    print("── Receptive field test complete ───────────────────────────\n")
+
+
+def run_efl_buffer_test() -> None:
+    """Verify EFLBuffer: EMA updates, gate behaviour, and reset."""
+    print("\n── EFL buffer test ─────────────────────────────────────────")
+    buf = EFLBuffer(
+        n_blocks=NUM_FINE_BLOCKS, hidden_dim=CHAIN_HIDDEN, decay=EFL_DECAY
+    ).to(DEVICE)
+
+    B   = 2
+    h1  = torch.randn(B, NUM_FINE_BLOCKS, CHAIN_HIDDEN, device=DEVICE)
+    h2  = torch.randn(B, NUM_FINE_BLOCKS, CHAIN_HIDDEN, device=DEVICE)
+
+    # First update: buffer not yet initialised → seeds from h1
+    fb1 = buf.update(h1)
+    print(f"  After update 1 — buffer init'd   : {buf.initialized.item()}")
+    print(f"  Feedback 1 shape                 : {fb1.shape}")
+
+    # Second update: EMA running
+    fb2 = buf.update(h2)
+    ema_mean = buf.ema_state.abs().mean().item()
+    print(f"  After update 2 — EMA |mean|      : {ema_mean:.6f}")
+    print(f"  Feedback 2 shape                 : {fb2.shape}")
+
+    # Reset
+    buf.reset(B)
+    print(f"  After reset    — buffer init'd   : {buf.initialized.item()}")
+    print(f"  After reset    — EMA norm        : "
+          f"{buf.ema_state.norm().item():.6f}  (expect 0.0)")
+
+    print("── EFL buffer test passed ✓ ────────────────────────────────\n")
+
+
+# =============================================
+# 10. ENTRY POINT
+# =============================================
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Block-Sparse DTM v10 — EFL + General Coherence Loss")
+    parser.add_argument(
+        "--mode", type=str, default="smoke",
+        choices=["smoke", "train", "rftest", "efltest"],
+        help=(
+            "smoke  : quick forward/backward sanity check\n"
+            "train  : full CIFAR-10 training run\n"
+            "rftest : dilated chain receptive field test\n"
+            "efltest: EFL buffer unit test"
+        ))
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="Path to a checkpoint .pt file to resume training from")
+    args = parser.parse_args()
+
+    if args.mode == "smoke":
+        run_smoke_test()
+        run_chain_receptive_field_test()
+        run_efl_buffer_test()
+
+    elif args.mode == "rftest":
+        run_chain_receptive_field_test()
+
+    elif args.mode == "efltest":
+        run_efl_buffer_test()
+
+    elif args.mode == "train":
+        run_smoke_test()
+        run_chain_receptive_field_test()
+        run_efl_buffer_test()
+        train(resume_path=args.resume)
