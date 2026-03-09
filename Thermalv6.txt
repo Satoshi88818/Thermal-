@@ -1,0 +1,173 @@
+# block_sparse_dtm_enhanced.py
+# ENHANCED TSU-Native DTM: 64x64 RGB Generation
+# Integrations: Continuous relaxation via hybrid approach (continuous sampling), better mixing via continuous reverse diffusion ODE, replaced PCD with modern diffusion loss (DSM only), stronger conditioning with U-Net style feature fusion
+# Updated: Removed PCD and block-Gibbs, switched to continuous ODE sampling for shorter/better mixing; Added CondProcessor U-Net for fusion; Reduced sweeps (not used); Comments for hybrid
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+from torchvision.utils import make_grid
+from typing import List, Tuple, Optional
+import time  # Added for speed profiling
+
+# =============================================
+# 0. MOCK IMPLEMENTATIONS (for CPU/GPU)
+# =============================================
+
+class SparseBilinear(nn.Module):
+    def __init__(self, in_features, out_features, block_size, sparsity=0.9):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.01)
+        mask = torch.rand_like(self.weight) > sparsity
+        self.register_buffer('mask', mask.float())
+        self.weight.data.mul_(self.mask)
+
+    def forward(self, x):
+        return F.linear(x, self.weight * self.mask)
+
+class EnergyFunction: pass
+
+def cosine_beta_schedule(T):
+    steps = np.arange(T + 1)
+    alphas_cumprod = np.cos((steps / T) * np.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - alphas_cumprod[1:] / alphas_cumprod[:-1]
+    return np.clip(betas, 0.0001, 0.9999)
+
+class ScoreMatchingLoss:
+    def __call__(self, energy_fn, x_t, t, noise):
+        # Simplified DSM: ||score + noise / sqrt(1 - alpha_bar)||^2 (fixed sign)
+        B = x_t.shape[0] // (x_t.shape[1] // noise.shape[1])  # Infer B from shapes
+        score = torch.autograd.grad(energy_fn(x_t, t).sum(), x_t, create_graph=True)[0]
+        score = score.view(B, -1)
+        noise = noise.view(B, -1)
+        alpha_bar = energy_fn.model.alpha_bar[t].view(-1, 1)
+        target = -noise / torch.sqrt(1 - alpha_bar)
+        return F.mse_loss(score, target)
+
+# =============================================
+# 1. CONFIGURATION
+# =============================================
+IMG_SIZE = 64
+CHANNELS = 3
+FINE_BLOCK_SIZE = 8
+FINE_BLOCKS_PER_SIDE = IMG_SIZE // FINE_BLOCK_SIZE  # 8
+NUM_FINE_BLOCKS = FINE_BLOCKS_PER_SIDE ** 2  # 64
+PBITS_PER_FINE_BLOCK = FINE_BLOCK_SIZE * FINE_BLOCK_SIZE * CHANNELS  # 192
+TOTAL_PBITS = NUM_FINE_BLOCKS * PBITS_PER_FINE_BLOCK  # 12,288
+
+COARSE_BLOCK_SIZE = 16
+COARSE_BLOCKS_PER_SIDE = IMG_SIZE // COARSE_BLOCK_SIZE  # 4
+NUM_COARSE_BLOCKS = COARSE_BLOCKS_PER_SIDE ** 2  # 16
+PBITS_PER_COARSE_BLOCK = COARSE_BLOCK_SIZE * COARSE_BLOCK_SIZE * CHANNELS  # 768
+
+T_STEPS = 100
+BATCH_SIZE = 16
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Running on: {DEVICE}")
+
+# Precompute schedule
+BETAS = torch.from_numpy(cosine_beta_schedule(T_STEPS)).to(DEVICE)
+ALPHAS = 1.0 - BETAS
+ALPHA_BAR = torch.cumprod(ALPHAS, dim=0)
+
+# =============================================
+# 2. CONDITIONING PROCESSOR (U-Net style feature fusion)
+# =============================================
+class CondProcessor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 16, 3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(16, 32, 3, stride=2, padding=1)
+        self.conv3 = nn.Conv2d(32, 64, 3, stride=2, padding=1)
+        self.conv4 = nn.Conv2d(64, 128, 3, stride=2, padding=1)
+        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.up2 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.up3 = nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2)
+        self.feat_out = nn.Conv2d(16, 128, 3, stride=1, padding=1)
+
+    def forward(self, cond_image):
+        d1 = F.relu(self.conv1(cond_image))
+        d2 = F.relu(self.conv2(d1))
+        d3 = F.relu(self.conv3(d2))
+        d4 = F.relu(self.conv4(d3))
+        u1 = F.relu(self.up1(d4) + d3)
+        u2 = F.relu(self.up2(u1) + d2)
+        u3 = F.relu(self.up3(u2) + d1)
+        feat = self.feat_out(u3)
+        cond_feat = F.avg_pool2d(feat, kernel_size=8, stride=8)  # [B,128,8,8]
+        return cond_feat
+
+# =============================================
+# 3. ENERGY FUNCTION (Enhanced: Deeper 4 layers + LayerNorm + hidden=2048)
+# =============================================
+class BlockSparseEnergy(nn.Module):
+    def __init__(self, features, sparsity=0.9, is_fine=False):
+        super().__init__()
+        hidden = 2048  # Larger hidden size
+        self.is_fine = is_fine
+        cond_dim = 128 if is_fine else 0
+        in_feat = features + cond_dim
+        self.local = nn.Sequential(
+            SparseBilinear(in_feat, hidden, block_size=in_feat, sparsity=sparsity),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            SparseBilinear(hidden, hidden, block_size=hidden, sparsity=sparsity),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            SparseBilinear(hidden, hidden, block_size=hidden, sparsity=sparsity),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            SparseBilinear(hidden, features, block_size=hidden, sparsity=sparsity)
+        )
+        self.skip = nn.Sequential(
+            SparseBilinear(in_feat, hidden, block_size=in_feat, sparsity=0.99),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            SparseBilinear(hidden, features, block_size=hidden, sparsity=0.99)
+        )
+        self.bias = nn.Parameter(torch.zeros(features))
+
+    def forward(self, x_block, t_bias, cond=None):
+        if cond is not None:
+            input_x = torch.cat([x_block, cond], dim=-1)
+        else:
+            input_x = x_block
+        h1 = self.local(input_x)
+        h2 = self.skip(input_x)
+        energy = -(h1 + 0.3 * h2).sum(dim=-1) - (self.bias * x_block).sum(dim=-1) - (t_bias * x_block).sum(dim=-1)
+        return energy  # [B']
+
+# =============================================
+# 4. DTM MODEL (Enhanced: Learnable temp scale, but not used in continuous sampling)
+# =============================================
+class BlockSparseDTM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.T = T_STEPS
+        self.betas = BETAS
+        self.alphas = ALPHAS
+        self.alpha_bar = ALPHA_BAR
+
+        self.time_emb = nn.Embedding(T_STEPS, 32)
+        self.time_proj_coarse = nn.Linear(32, PBITS_PER_COARSE_BLOCK)
+        self.time_proj_fine = nn.Linear(32, PBITS_PER_FINE_BLOCK)
+        self.energy_fn_coarse = BlockSparseEnergy(PBITS_PER_COARSE_BLOCK, is_fine=False)
+        self.energy_fn_fine = BlockSparseEnergy(PBITS_PER_FINE_BLOCK, is_fine=True)
+        self.cond_processor = CondProcessor()
+        self.coarse_grid = (COARSE_BLOCKS_PER_SIDE, COARSE_BLOCKS_PER_SIDE)
+        self.fine_grid = (FINE_BLOCKS_PER_SIDE, FINE_BLOCKS_PER_SIDE)
+        self.temp_scale = nn.Parameter(torch.tensor(1.0))  # Learnable temperature scale
+
+    def add_noise(self, x0, t):
+        noise = torch.randn_like(x0)
+        sqrt_ab = self.alpha_bar[t].view(-1, 1, 1, 1).sqrt()
+        sqrt_one_minus_ab = (1 - self.alpha_bar[t]).view(-1, 1, 1, 1).sqrt()
+        return sqrt_ab * x0 + sqrt_one_minus_ab * noise, noise
+
+   
