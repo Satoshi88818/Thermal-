@@ -1,0 +1,479 @@
+# block_sparse_dtm_fixed.py
+# FULLY FIXED & ENHANCED TSU-Native DTM Prototype: 64x64 RGB Generation
+#Improvements: Increased Energy Expressivity, Multi-Scale Hierarchical Blocks, Strengthened PCD and Mixing
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+from torchvision.utils import make_grid
+from typing import List, Tuple, Optional
+
+# =============================================
+# 0. MOCK THORML (for CPU/GPU fallback)
+# =============================================
+try:
+    import thrml
+    from thrml import TSU, GibbsSampler, EnergyFunction
+    from thrml.nn import SparseBilinear
+    from thrml.sampling import BlockGibbsScheduler
+    from thrml.training import ScoreMatchingLoss, PersistentContrastiveDivergence
+    from thrml.noise import cosine_beta_schedule
+except ImportError:
+    print("thrml not found. Using mock implementations for CPU/GPU.")
+
+    class SparseBilinear(nn.Module):
+        def __init__(self, in_features, out_features, block_size, sparsity=0.9):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.01)
+            mask = torch.rand_like(self.weight) > sparsity
+            self.register_buffer('mask', mask.float())
+            self.weight.data.mul_(self.mask)
+
+        def forward(self, x):
+            return F.linear(x, self.weight * self.mask)
+
+    class EnergyFunction: pass
+
+    def cosine_beta_schedule(T):
+        steps = np.arange(T + 1)
+        alphas_cumprod = np.cos((steps / T) * np.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - alphas_cumprod[1:] / alphas_cumprod[:-1]
+        return np.clip(betas, 0.0001, 0.9999)
+
+    class ScoreMatchingLoss:
+        def __call__(self, energy_fn, x_t, t, noise):
+            # Simplified DSM: ||score - noise||^2
+            B = x_t.shape[0]
+            score = torch.autograd.grad(energy_fn(x_t, t).sum(), x_t, create_graph=True)[0]
+            score = score.view(B, -1)
+            noise = noise.view(B, -1)
+            return F.mse_loss(score, noise / torch.sqrt(1 - energy_fn.model.alpha_bar[t]).view(-1, 1))
+
+    class PersistentContrastiveDivergence:
+        def __init__(self, num_chains, steps=10):
+            self.num_chains = num_chains
+            self.steps = steps
+            self.fantasy = None
+            self.scheduler = BlockGibbsScheduler(block_pattern="checkerboard", sweeps_per_update=16)  # Strengthened sweeps
+
+        def step(self, fantasy, energy_fn_per_block, t_tensor):
+            self.fantasy = fantasy
+            for _ in range(self.steps):
+                self.fantasy = self.scheduler.step(self.fantasy, energy_fn_per_block)
+            return self.fantasy
+
+        def contrastive_loss(self):
+            return torch.tensor(0.0)  # Not used directly; computed in training loop
+
+    class BlockGibbsScheduler:
+        def __init__(self, block_pattern="checkerboard", sweeps_per_update=16):
+            self.pattern = block_pattern
+            self.sweeps = sweeps_per_update
+
+        def step(self, x_blocks, energy_fn_per_block):
+            B, N, D = x_blocks.shape
+            grid = int(N ** 0.5)  # e.g., 8x8 or 4x4
+            for sweep in range(self.sweeps):
+                for phase in [0, 1]:
+                    idx = []
+                    for i in range(grid):
+                        for j in range(grid):
+                            if (i + j) % 2 == phase:
+                                idx.append(i * grid + j)
+                    if not idx: continue
+                    idx = torch.tensor(idx, device=x_blocks.device)
+                    blk = x_blocks[:, idx]  # [B, num_active, D]
+                    B_blk = blk.shape[0]
+                    # Flip each bit with p = sigmoid(-ΔE)
+                    for d in range(D):
+                        x_flip = blk.clone()
+                        x_flip[..., d] = 1 - x_flip[..., d]
+                        e_curr = energy_fn_per_block(blk.flatten(0, 1))
+                        e_flip = energy_fn_per_block(x_flip.flatten(0, 1))
+                        delta_e = e_flip - e_curr
+                        prob_flip = torch.sigmoid(-delta_e)
+                        flip = torch.bernoulli(prob_flip).bool()
+                        blk = blk.flatten(0, 1)
+                        blk[flip, d] = 1 - blk[flip, d]
+                        blk = blk.view(B_blk, -1, D)
+                    x_blocks[:, idx] = blk
+            return x_blocks
+
+    def has_tsu(): return False
+
+    thrml = type('thrml', (), {
+        'has_tsu': has_tsu,
+        'nn': type('nn', (), {'SparseBilinear': SparseBilinear}),
+        'sampling': type('sampling', (), {'BlockGibbsScheduler': BlockGibbsScheduler}),
+        'training': type('training', (), {'ScoreMatchingLoss': ScoreMatchingLoss, 'PersistentContrastiveDivergence': PersistentContrastiveDivergence}),
+        'noise': type('noise', (), {'cosine_beta_schedule': cosine_beta_schedule}),
+    })()
+
+# =============================================
+# 1. CONFIGURATION
+# =============================================
+IMG_SIZE = 64
+CHANNELS = 3
+FINE_BLOCK_SIZE = 8
+FINE_BLOCKS_PER_SIDE = IMG_SIZE // FINE_BLOCK_SIZE  # 8
+NUM_FINE_BLOCKS = FINE_BLOCKS_PER_SIDE ** 2  # 64
+PBITS_PER_FINE_BLOCK = FINE_BLOCK_SIZE * FINE_BLOCK_SIZE * CHANNELS  # 192
+TOTAL_PBITS = NUM_FINE_BLOCKS * PBITS_PER_FINE_BLOCK  # 12,288
+
+COARSE_BLOCK_SIZE = 16
+COARSE_BLOCKS_PER_SIDE = IMG_SIZE // COARSE_BLOCK_SIZE  # 4
+NUM_COARSE_BLOCKS = COARSE_BLOCKS_PER_SIDE ** 2  # 16
+PBITS_PER_COARSE_BLOCK = COARSE_BLOCK_SIZE * COARSE_BLOCK_SIZE * CHANNELS  # 768
+
+T_STEPS = 100
+SWEEPS_PER_STEP = 8
+BATCH_SIZE = 16
+FANTASY_CHAINS = 512  # Increased for strengthened PCD
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Running on: {DEVICE}")
+
+# Precompute schedule
+BETAS = torch.from_numpy(cosine_beta_schedule(T_STEPS)).to(DEVICE)
+ALPHAS = 1.0 - BETAS
+ALPHA_BAR = torch.cumprod(ALPHAS, dim=0)
+
+# =============================================
+# 2. ENERGY FUNCTION (Improved: Deeper with ReLU for expressivity, conditional for hierarchy)
+# =============================================
+class BlockSparseEnergy(nn.Module):
+    def __init__(self, features, sparsity=0.9):
+        super().__init__()
+        hidden = features // 2
+        self.local = nn.Sequential(
+            SparseBilinear(features, hidden, block_size=features, sparsity=sparsity),
+            nn.ReLU(),
+            SparseBilinear(hidden, features, block_size=features, sparsity=sparsity)
+        )
+        self.skip = nn.Sequential(
+            SparseBilinear(features, hidden, block_size=features, sparsity=0.99),
+            nn.ReLU(),
+            SparseBilinear(hidden, features, block_size=features, sparsity=0.99)
+        )
+        self.bias = nn.Parameter(torch.zeros(features))
+
+    def forward(self, x_block, t_bias, cond=None):
+        # x_block: [B', features], t_bias: [B', features], cond: [B', features] optional
+        h1 = self.local(x_block)
+        h2 = self.skip(x_block)
+        energy = -(h1 + 0.3 * h2).sum(dim=-1) - (self.bias * x_block).sum(dim=-1) - (t_bias * x_block).sum(dim=-1)
+        if cond is not None:
+            energy -= (cond * x_block).sum(dim=-1) * 10.0  # Strong conditioning for hierarchy
+        return energy  # [B']
+
+
+# =============================================
+# 3. DTM MODEL (Improved: Hierarchical coarse/fine, vectorized, clean)
+# =============================================
+class BlockSparseDTM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.T = T_STEPS
+        self.betas = BETAS
+        self.alphas = ALPHAS
+        self.alpha_bar = ALPHA_BAR
+
+        self.time_emb = nn.Embedding(T_STEPS, 32)
+        self.time_proj_coarse = nn.Linear(32, PBITS_PER_COARSE_BLOCK)
+        self.time_proj_fine = nn.Linear(32, PBITS_PER_FINE_BLOCK)
+        self.energy_fn_coarse = BlockSparseEnergy(PBITS_PER_COARSE_BLOCK)
+        self.energy_fn_fine = BlockSparseEnergy(PBITS_PER_FINE_BLOCK)
+        self.coarse_grid = (COARSE_BLOCKS_PER_SIDE, COARSE_BLOCKS_PER_SIDE)
+        self.fine_grid = (FINE_BLOCKS_PER_SIDE, FINE_BLOCKS_PER_SIDE)
+
+    def add_noise(self, x0, t):
+        noise = torch.randn_like(x0)
+        sqrt_ab = self.alpha_bar[t].view(-1, 1, 1, 1).sqrt()
+        sqrt_one_minus_ab = (1 - self.alpha_bar[t]).view(-1, 1, 1, 1).sqrt()
+        return sqrt_ab * x0 + sqrt_one_minus_ab * noise, noise
+
+    def blockify_coarse(self, x):
+        B, C, H, W = x.shape
+        x = x.permute(0, 2, 3, 1).contiguous()
+        x = x.view(B, COARSE_BLOCKS_PER_SIDE, COARSE_BLOCK_SIZE, COARSE_BLOCKS_PER_SIDE, COARSE_BLOCK_SIZE, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        x = x.view(B, NUM_COARSE_BLOCKS, PBITS_PER_COARSE_BLOCK)
+        return x
+
+    def unblockify_coarse(self, x_blocks):
+        B = x_blocks.shape[0]
+        x = x_blocks.view(B, COARSE_BLOCKS_PER_SIDE, COARSE_BLOCKS_PER_SIDE, COARSE_BLOCK_SIZE, COARSE_BLOCK_SIZE, CHANNELS)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        x = x.view(B, IMG_SIZE, IMG_SIZE, CHANNELS)
+        x = x.permute(0, 3, 1, 2).contiguous()
+        return x
+
+    def blockify_fine(self, x):
+        B, C, H, W = x.shape
+        x = x.permute(0, 2, 3, 1).contiguous()
+        x = x.view(B, FINE_BLOCKS_PER_SIDE, FINE_BLOCK_SIZE, FINE_BLOCKS_PER_SIDE, FINE_BLOCK_SIZE, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        x = x.view(B, NUM_FINE_BLOCKS, PBITS_PER_FINE_BLOCK)
+        return x
+
+    def unblockify_fine(self, x_blocks):
+        B = x_blocks.shape[0]
+        x = x_blocks.view(B, FINE_BLOCKS_PER_SIDE, FINE_BLOCKS_PER_SIDE, FINE_BLOCK_SIZE, FINE_BLOCK_SIZE, CHANNELS)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        x = x.view(B, IMG_SIZE, IMG_SIZE, CHANNELS)
+        x = x.permute(0, 3, 1, 2).contiguous()
+        return x
+
+    def energy_coarse(self, x_blocks, t):
+        B, num_blocks, D = x_blocks.shape
+        t_emb = self.time_emb(t)  # [B, 32]
+        t_proj = self.time_proj_coarse(t_emb)  # [B, PBITS_COARSE]
+        t_bias = t_proj.unsqueeze(1).expand(-1, num_blocks, -1).flatten(0, 1)  # [B*16, PBITS_COARSE]
+        x_flat = x_blocks.flatten(0, 1)  # [B*16, PBITS_COARSE]
+        energies = self.energy_fn_coarse(x_flat, t_bias)  # [B*16]
+        return energies.view(B, num_blocks).sum(dim=1)  # [B]
+
+    def energy_fine(self, x_blocks, t, cond_blocks=None):
+        B, num_blocks, D = x_blocks.shape
+        t_emb = self.time_emb(t)  # [B, 32]
+        t_proj = self.time_proj_fine(t_emb)  # [B, PBITS_FINE]
+        t_bias = t_proj.unsqueeze(1).expand(-1, num_blocks, -1).flatten(0, 1)  # [B*64, PBITS_FINE]
+        x_flat = x_blocks.flatten(0, 1)  # [B*64, PBITS_FINE]
+        if cond_blocks is not None:
+            cond_flat = cond_blocks.flatten(0, 1)
+        else:
+            cond_flat = None
+        energies = self.energy_fn_fine(x_flat, t_bias, cond=cond_flat)  # [B*64]
+        return energies.view(B, num_blocks).sum(dim=1)  # [B]
+
+    @torch.no_grad()
+    def sample(self, batch_size=8, sweeps=SWEEPS_PER_STEP, device=DEVICE):
+        self.eval()
+
+        # Sample coarse level
+        x_coarse = torch.bernoulli(torch.rand(batch_size, NUM_COARSE_BLOCKS, PBITS_PER_COARSE_BLOCK, device=device)).float()
+        scheduler_coarse = BlockGibbsScheduler(block_pattern="checkerboard", sweeps_per_update=sweeps)
+
+        for t in reversed(range(self.T)):
+            t_tensor = torch.full((batch_size,), t, dtype=torch.long, device=device)
+            t_emb = self.time_emb(t_tensor)  # [B, 32]
+            t_proj = self.time_proj_coarse(t_emb)  # [B, PBITS_COARSE]
+
+            def energy_fn_coarse(blk):
+                B_prime = blk.shape[0]
+                t_b = t_proj[:B_prime // NUM_COARSE_BLOCKS].unsqueeze(1).expand(-1, NUM_COARSE_BLOCKS, -1).flatten(0, 1)[:B_prime]
+                return self.energy_fn_coarse(blk, t_b)
+
+            x_coarse = scheduler_coarse.step(x_coarse, energy_fn_coarse)
+
+            if (t + 1) % 20 == 0 or t == 0:
+                print(f"Reverse step {t+1}/{self.T} (coarse)")
+
+        coarse_image = self.unblockify_coarse(x_coarse)
+
+        # Sample fine level, conditioned on coarse
+        x_fine = self.blockify_fine(coarse_image)
+        scheduler_fine = BlockGibbsScheduler(block_pattern="checkerboard", sweeps_per_update=sweeps)
+        cond_blocks = self.blockify_fine(coarse_image)  # For conditioning
+
+        for t in reversed(range(self.T)):
+            t_tensor = torch.full((batch_size,), t, dtype=torch.long, device=device)
+            t_emb = self.time_emb(t_tensor)  # [B, 32]
+            t_proj = self.time_proj_fine(t_emb)  # [B, PBITS_FINE]
+
+            def energy_fn_fine(blk):
+                B_prime = blk.shape[0]
+                t_b = t_proj[:B_prime // NUM_FINE_BLOCKS].unsqueeze(1).expand(-1, NUM_FINE_BLOCKS, -1).flatten(0, 1)[:B_prime]
+                cond_b = cond_blocks.flatten(0, 1)[:B_prime]
+                return self.energy_fn_fine(blk, t_b, cond=cond_b)
+
+            x_fine = scheduler_fine.step(x_fine, energy_fn_fine)
+
+            if (t + 1) % 20 == 0 or t == 0:
+                print(f"Reverse step {t+1}/{self.T} (fine)")
+
+        x = self.unblockify_fine(x_fine)
+        return (x.clamp(-1, 1) + 1) / 2  # [0,1]
+
+
+# =============================================
+# 4. DATA LOADER
+# =============================================
+transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Lambda(lambda x: (x > 0.5).float()),
+])
+
+train_data = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+
+
+# =============================================
+# 5. TRAINING LOOP (Improved: Hierarchical losses, strengthened PCD with proper CD computation)
+# =============================================
+def train_dtm(model, epochs=50, lr=1e-4):
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    sm_loss_fn = ScoreMatchingLoss()
+    pcd_fine = PersistentContrastiveDivergence(num_chains=FANTASY_CHAINS, steps=10)  # Strengthened
+    pcd_coarse = PersistentContrastiveDivergence(num_chains=FANTASY_CHAINS, steps=10)  # Strengthened
+
+    fantasy_fine = torch.bernoulli(torch.rand(FANTASY_CHAINS, NUM_FINE_BLOCKS, PBITS_PER_FINE_BLOCK, device=DEVICE)).float()
+    fantasy_coarse = torch.bernoulli(torch.rand(FANTASY_CHAINS, NUM_COARSE_BLOCKS, PBITS_PER_COARSE_BLOCK, device=DEVICE)).float()
+
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for i, (x0, _) in enumerate(train_loader):
+            x0 = x0.to(DEVICE, non_blocking=True)
+            batch_size = x0.shape[0]
+            t = torch.randint(0, model.T, (batch_size,), device=DEVICE)
+
+            xt, noise = model.add_noise(x0, t)
+
+            # Fine level
+            x0_fine = model.blockify_fine(x0)
+            xt_fine = model.blockify_fine(xt)
+
+            def energy_wrapper_fine(x_flat, t_batch=None):
+                if t_batch is None:
+                    t_batch = t
+                x_reshaped = x_flat.view(batch_size, NUM_FINE_BLOCKS, PBITS_PER_FINE_BLOCK)
+                return model.energy_fine(x_reshaped, t_batch)
+
+            loss_fine = sm_loss_fn(energy_wrapper_fine, xt_fine.flatten(0, 1), t, noise)
+
+            # Coarse level
+            x0_coarse = model.blockify_coarse(x0)
+            xt_coarse = model.blockify_coarse(xt)
+
+            def energy_wrapper_coarse(x_flat, t_batch=None):
+                if t_batch is None:
+                    t_batch = t
+                x_reshaped = x_flat.view(batch_size, NUM_COARSE_BLOCKS, PBITS_PER_COARSE_BLOCK)
+                return model.energy_coarse(x_reshaped, t_batch)
+
+            loss_coarse = sm_loss_fn(energy_wrapper_coarse, xt_coarse.flatten(0, 1), t, noise)
+
+            loss = loss_fine + loss_coarse
+
+            # PCD for fine
+            chain_batch = min(batch_size, FANTASY_CHAINS)
+            t_fantasy = t[:chain_batch]
+
+            def energy_fn_per_block_fine(blk):
+                B_prime = blk.shape[0]
+                num_chains_prime = B_prime // NUM_FINE_BLOCKS
+                t_emb = model.time_emb(t_fantasy[:num_chains_prime])
+                t_proj = model.time_proj_fine(t_emb)
+                t_b = t_proj.unsqueeze(1).expand(-1, NUM_FINE_BLOCKS, -1).flatten(0, 1)[:B_prime]
+                return model.energy_fn_fine(blk, t_b)
+
+            fantasy_fine[:chain_batch] = pcd_fine.step(fantasy_fine[:chain_batch], energy_fn_per_block_fine, t_fantasy)
+
+            positive_fine = model.energy_fine(x0_fine, t).mean()
+            negative_fine = model.energy_fine(fantasy_fine[:chain_batch], t_fantasy).mean()
+            cd_loss_fine = positive_fine - negative_fine
+            loss += cd_loss_fine
+
+            # PCD for coarse
+            def energy_fn_per_block_coarse(blk):
+                B_prime = blk.shape[0]
+                num_chains_prime = B_prime // NUM_COARSE_BLOCKS
+                t_emb = model.time_emb(t_fantasy[:num_chains_prime])
+                t_proj = model.time_proj_coarse(t_emb)
+                t_b = t_proj.unsqueeze(1).expand(-1, NUM_COARSE_BLOCKS, -1).flatten(0, 1)[:B_prime]
+                return model.energy_fn_coarse(blk, t_b)
+
+            fantasy_coarse[:chain_batch] = pcd_coarse.step(fantasy_coarse[:chain_batch], energy_fn_per_block_coarse, t_fantasy)
+
+            positive_coarse = model.energy_coarse(x0_coarse, t).mean()
+            negative_coarse = model.energy_coarse(fantasy_coarse[:chain_batch], t_fantasy).mean()
+            cd_loss_coarse = positive_coarse - negative_coarse
+            loss += cd_loss_coarse
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+
+            if i % 100 == 0:
+                print(f"Epoch {epoch:02d} | Batch {i:04d} | Loss: {loss.item():.4f}")
+
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch:02d} | Avg Loss: {avg_loss:.4f}")
+
+        if epoch % 10 == 9:
+            samples = model.sample(batch_size=8)
+            save_image_grid(samples, f"samples_epoch_{epoch+1}.png")
+            print(f"Saved samples_epoch_{epoch+1}.png")
+
+
+# =============================================
+# 6. UTILS
+# =============================================
+def save_image_grid(img_tensor: torch.Tensor, path: str, nrow: int = 8):
+    os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
+    grid = make_grid(img_tensor, nrow=nrow, padding=2, normalize=False)
+    plt.figure(figsize=(12, 12))
+    plt.imshow(grid.permute(1, 2, 0).cpu().numpy())
+    plt.axis('off')
+    plt.savefig(path, bbox_inches='tight', dpi=150)
+    plt.close()
+    print(f"Image grid saved: {path}")
+
+
+# =============================================
+# 7. FID EVALUATION (Optional)
+# =============================================
+def compute_fid(real_images: List[torch.Tensor], fake_images: List[torch.Tensor]) -> float:
+    try:
+        import fid
+        from fid.fid_score import calculate_fid_given_paths
+        os.makedirs("tmp_real", exist_ok=True)
+        os.makedirs("tmp_fake", exist_ok=True)
+        for i, img in enumerate(real_images):
+            plt.imsave(f"tmp_real/{i:04d}.png", img.permute(1,2,0).cpu().numpy())
+        for i, img in enumerate(fake_images):
+            plt.imsave(f"tmp_fake/{i:04d}.png", img.permute(1,2,0).cpu().numpy())
+        fid_value = calculate_fid_given_paths(['tmp_real', 'tmp_fake'], batch_size=32, device=DEVICE, dims=2048)
+        import shutil
+        shutil.rmtree("tmp_real")
+        shutil.rmtree("tmp_fake")
+        return fid_value
+    except:
+        print("FID not available (install pytorch-fid)")
+        return -1.0
+
+
+# =============================================
+# 8. RUN
+# =============================================
+if __name__ == "__main__":
+    model = BlockSparseDTM().to(DEVICE)
+
+    # === TRAIN ===
+    # train_dtm(model, epochs=100)
+
+    # === OR LOAD & SAMPLE ===
+    ckpt_path = "block_sparse_dtm.pth"
+    if os.path.exists(ckpt_path):
+        print(f"Loading pretrained model from {ckpt_path}")
+        model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+    else:
+        print(f"No checkpoint found at {ckpt_path}. Training from scratch...")
+        train_dtm(model, epochs=10)  # Short demo
+        torch.save(model.state_dict(), ckpt_path)
+        print(f"Model saved to {ckpt_path}")
+
+    print("Generating 64 samples...")
+    samples = model.sample(batch_size=64)
+    save_image_grid(samples, "final_samples_64x64.png", nrow=8)
+    print("Generated 64 samples → final_samples_64x64.png")
